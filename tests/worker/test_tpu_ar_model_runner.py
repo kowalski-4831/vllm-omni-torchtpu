@@ -22,8 +22,12 @@ import torch
 from vllm.multimodal.utils import set_mm_embedding_modality
 from vllm.sequence import IntermediateTensors
 from vllm_omni.config import OmniModelConfig
+from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
+    OmniKVTransferManager,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUModelRunnerOutput
 
 from tests.omni_test_utils import build_qwen3_omni_thinker_stub
 from vllm_omni_torchtpu.worker.tpu_ar_model_runner import (
@@ -85,6 +89,12 @@ def tpu_ar_model_runner(request: pytest.FixtureRequest) -> TPUARModelRunner:
     )
 
 
+def _async_output(inner: Any) -> AsyncTPUModelRunnerOutput:
+    out = AsyncTPUModelRunnerOutput.__new__(AsyncTPUModelRunnerOutput)
+    out._model_runner_output = inner
+    return out
+
+
 class _StageModel:
     def __init__(
         self,
@@ -113,10 +123,11 @@ class _StageModel:
     ("tpu_ar_model_runner", "expected"),
     [
         (_stage_config(model_stage="thinker", stage_id=0), ("thinker", 0)),
+        (_stage_config(model_stage="talker", stage_id=1), ("talker", 1)),
         (SimpleNamespace(architectures=[]), (None, None)),
     ],
     indirect=["tpu_ar_model_runner"],
-    ids=["omni_stage_config", "plain_vllm_config"],
+    ids=["thinker_stage_config", "talker_stage_config", "plain_vllm_config"],
 )
 def test_tpu_ar_model_runner_stage_metadata(
     tpu_ar_model_runner: TPUARModelRunner,
@@ -125,36 +136,36 @@ def test_tpu_ar_model_runner_stage_metadata(
     assert (tpu_ar_model_runner.model_stage, tpu_ar_model_runner.stage_id) == expected
 
 
-@pytest.mark.parametrize(
-    ("model_config", "speculative_config", "match"),
-    [
-        (
-            _stage_config(
-                custom_process_next_stage_input_func="pkg.mod.thinker2talker"
-            ),
-            None,
-            "connectors",
-        ),
-        (
-            _stage_config(),
-            SimpleNamespace(method="eagle3"),
-            "speculative_config",
-        ),
-    ],
-    ids=["connectors", "speculative_config"],
-)
-def test_tpu_ar_model_runner_init_rejects_unsupported_config(
-    model_config: Any,
-    speculative_config: Any,
-    match: str,
-) -> None:
-    vllm_config = SimpleNamespace(
-        model_config=model_config,
-        speculative_config=speculative_config,
-    )
-    with pytest.raises(NotImplementedError, match=match):
+def test_tpu_ar_model_runner_init_connectors_and_rejects_speculative() -> None:
+    fake_kv_mgr = object()
+    with (
+        patch.object(
+            OmniKVTransferManager, "from_vllm_config", return_value=fake_kv_mgr
+        ) as mock_kv,
+        patch.object(TPUARModelRunner, "init_omni_connectors") as mock_init_conn,
+    ):
+        conn_cfg = _stage_config(
+            custom_process_next_stage_input_func="pkg.mod.thinker2talker"
+        )
+        vllm_cfg = SimpleNamespace(model_config=conn_cfg, speculative_config=None)
+        conn_runner = TPUARModelRunner(
+            vllm_cfg,
+            torch.device("tpu"),
+            profiler_rank=0,
+            profiler_world_size=1,
+        )
+        mock_kv.assert_called_once_with(conn_runner.vllm_config, conn_cfg)
+        mock_init_conn.assert_called_once_with(
+            model_config=conn_cfg,
+            kv_transfer_manager=fake_kv_mgr,
+        )
+
+    with pytest.raises(NotImplementedError, match="speculative_config"):
         TPUARModelRunner(
-            vllm_config,
+            SimpleNamespace(
+                model_config=_stage_config(),
+                speculative_config=SimpleNamespace(method="eagle3"),
+            ),
             torch.device("tpu"),
             profiler_rank=0,
             profiler_world_size=1,
@@ -655,3 +666,187 @@ def test_tpu_ar_model_runner_capture_model_precompiles_mm_buckets(
         [[1, 64, 128]],
         [[1, 64, 256]],
     ]
+
+
+def test_tpu_ar_model_runner_multi_chunk_inter_stage_outputs(
+    tpu_ar_model_runner: TPUARModelRunner,
+) -> None:
+    """Multi-chunk step slices each request from its own chunk's outputs."""
+    runner = tpu_ar_model_runner
+    runner.input_batch = SimpleNamespace(
+        num_reqs=2,
+        req_ids=["req-decode", "req-prefill"],
+        num_computed_tokens_cpu=[3, 0],
+    )
+
+    class MultiChunkThinker:
+        has_preprocess = False
+        has_postprocess = False
+
+        def __init__(self) -> None:
+            self.call_idx = 0
+
+        def __call__(self, **kwargs: Any) -> tuple[torch.Tensor, dict[str, Any]]:
+            self.call_idx += 1
+            if self.call_idx == 1:
+                # Chunk 0: 1 decode token for req-decode (padded to 4)
+                hs = torch.full((4, 4), 10.0)
+                layer = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+                return hs, {"hidden_states": {"layers": {"24": layer}}}
+            # Chunk 1: 3 prefill tokens for req-prefill (padded to 4)
+            hs = torch.full((4, 4), 20.0)
+            layer = torch.arange(100, 116, dtype=torch.float32).reshape(4, 4)
+            return hs, {"hidden_states": {"layers": {"24": layer}}}
+
+        def make_omni_output(
+            self, model_outputs: tuple[torch.Tensor, dict[str, Any]], **kwargs: Any
+        ) -> OmniOutput:
+            hs, sidecar = model_outputs
+            return OmniOutput(text_hidden_states=hs, multimodal_outputs=sidecar)
+
+    runner.model = MultiChunkThinker()
+
+    # Chunk 0: req-decode [0:1]
+    runner._omni_chunk_req_slice = (0, 1)
+    runner.query_start_loc_np = [0, 1]
+    runner.forward_model(torch.zeros(4, dtype=torch.int32), torch.arange(4))
+    assert runner._omni_chunk_req_slice is None
+
+    # Chunk 1: req-prefill [1:2] with 3 tokens
+    runner._omni_chunk_req_slice = (1, 2)
+    runner.query_start_loc_np = [0, 3]
+    runner.forward_model(torch.zeros(4, dtype=torch.int32), torch.arange(4))
+    assert runner._omni_chunk_req_slice is None
+
+    # Warmup / _dummy_run with _omni_chunk_req_slice=None must not append outputs
+    runner.forward_model(torch.zeros(4, dtype=torch.int32), torch.arange(4))
+    assert len(runner._omni_chunk_outputs) == 2
+
+    inner_out = SimpleNamespace(
+        req_ids=["req-decode", "req-prefill"], inter_stage_outputs=None
+    )
+    with patch.object(
+        OmniTPUModelRunner, "sample_tokens", return_value=_async_output(inner_out)
+    ):
+        runner.sample_tokens()
+
+    assert len(inner_out.inter_stage_outputs) == 2
+    assert torch.equal(
+        inner_out.inter_stage_outputs[0]["hidden_states"]["layers"]["24"],
+        torch.arange(16, dtype=torch.float32).reshape(4, 4)[:1],
+    )
+    assert torch.equal(
+        inner_out.inter_stage_outputs[1]["hidden_states"]["layers"]["24"],
+        torch.arange(100, 116, dtype=torch.float32).reshape(4, 4)[:3],
+    )
+
+
+def test_tpu_ar_model_runner_full_payload_connector_lifecycle() -> None:
+    runner = TPUARModelRunner(
+        SimpleNamespace(
+            model_config=_stage_config(
+                model_stage="talker", stage_id=1, async_chunk=False
+            ),
+            speculative_config=None,
+        ),
+        torch.device("tpu"),
+        profiler_rank=0,
+        profiler_world_size=1,
+    )
+    runner._omni_connector_initialized = True
+    runner._pending_full_payload_send = {"req-done", "req-evicted"}
+    runner.requests = {"req-done": SimpleNamespace(prompt_token_ids=[1, 2, 3])}
+    runner.register_chunk_recv = MagicMock()
+    runner.recv_full_payload_inputs = MagicMock()
+    runner.flush_full_payload_outputs = MagicMock()
+    runner.attach_omni_connector_output = MagicMock(side_effect=lambda x: x)
+
+    sched_out = SimpleNamespace(
+        pending_input_registrations=["reg-0"],
+        finished_req_ids={"req-done"},
+    )
+    with patch.object(OmniTPUModelRunner, "execute_model", return_value=None):
+        assert runner.execute_model(sched_out) is None
+
+    runner.register_chunk_recv.assert_called_once_with("reg-0")
+    runner.recv_full_payload_inputs.assert_called_once_with(sched_out)
+    runner.flush_full_payload_outputs.assert_called_once_with(
+        {"req-done", "req-evicted"}
+    )
+
+
+def test_sync_local_stage_payloads_moves_ready_active_payloads() -> None:
+    runner = TPUARModelRunner(
+        SimpleNamespace(
+            model_config=_stage_config(
+                model_stage="talker", stage_id=1, async_chunk=False
+            ),
+            speculative_config=None,
+        ),
+        torch.device("tpu"),
+        profiler_rank=0,
+        profiler_world_size=1,
+    )
+    runner.model = SimpleNamespace(gpu_resident_buffer_keys=set())
+    runner.requests = {"req-ready": SimpleNamespace(), "req-pending": SimpleNamespace()}
+    runner._local_stage_payload_cache = {
+        "req-ready": {"embed": {"prefill": torch.ones(2, 4)}},
+        "req-pending": {"embed": {"prefill": torch.zeros(2, 4)}},
+        "req-unknown": {"embed": {"prefill": torch.ones(1, 4)}},
+    }
+    runner._full_payload_pending_broadcast_req_ids = {"req-pending"}
+
+    runner._sync_local_stage_payloads()
+
+    assert "req-ready" not in runner._local_stage_payload_cache
+    assert "req-pending" in runner._local_stage_payload_cache
+    assert "req-unknown" in runner._local_stage_payload_cache
+    assert torch.equal(
+        runner.model_intermediate_buffer["req-ready"]["embed"]["prefill"],
+        torch.ones(2, 4),
+    )
+    assert "req-pending" not in runner.model_intermediate_buffer
+
+
+def test_update_states_manages_intermediate_buffer_and_connector_cleanup(
+    tpu_ar_model_runner: TPUARModelRunner,
+) -> None:
+    runner = tpu_ar_model_runner
+    runner.model = SimpleNamespace(gpu_resident_buffer_keys=set())
+    runner._omni_connector_initialized = True
+    runner.cleanup_finished_request = MagicMock()
+    runner.model_intermediate_buffer["req-old"] = {"embed": {"prefill": torch.ones(1)}}
+    req_state_new = SimpleNamespace()
+    runner.requests = {"req-new": req_state_new, "req-cached": SimpleNamespace()}
+
+    sched_out = SimpleNamespace(
+        finished_req_ids={"req-old"},
+        scheduled_new_reqs=[
+            SimpleNamespace(
+                req_id="req-new",
+                additional_information={"meta": {"num_processed_tokens": 4}},
+                model_intermediate_buffer={"embed": {"prefill": torch.zeros(2, 4)}},
+            )
+        ],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=["req-cached"],
+            additional_information={"req-cached": {"meta": {"resumable": True}}},
+        ),
+    )
+    with patch.object(OmniTPUModelRunner, "_update_states", return_value=True):
+        assert runner._update_states(sched_out) is True
+
+    assert "req-old" not in runner.model_intermediate_buffer
+    runner.cleanup_finished_request.assert_called_once_with("req-old")
+    assert runner.model_intermediate_buffer["req-new"]["meta"] == {
+        "num_processed_tokens": 4
+    }
+    assert torch.equal(
+        runner.model_intermediate_buffer["req-new"]["embed"]["prefill"],
+        torch.zeros(2, 4),
+    )
+    assert (
+        req_state_new.additional_information_cpu
+        is runner.model_intermediate_buffer["req-new"]
+    )
+    assert runner.model_intermediate_buffer["req-cached"]["meta"] == {"resumable": True}
