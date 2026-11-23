@@ -12,22 +12,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU static-shape bucketing patch for ``Qwen3OmniMoeAudioEncoder``.
+"""TPU static-shape bucketing patches for Qwen3-Omni Thinker audio and vision encoders.
 
-Fixes two TPU issues in pinned ``vllm-omni==0.32.0rc1``
-(``Qwen3OmniMoeAudioEncoder.forward``):
-1. Evaluates 100-frame window counts with integer division on CPU to avoid TPU
-   float32 reciprocal rounding on exact multiples of 100 frames
-   (see upstream ``vllm-omni#9010``).
-2. Splits clips longer than 128 windows along 128-window (``16 * n_window_infer``)
-   boundaries, packs consecutive clips into power-of-2 window buckets
-   ``(8, 16, 32, 64, 128)``, and compiles one fused TPU graph per bucket via
-   ``torch.compile(..., backend="tpu", fullgraph=True, dynamic=False)``.
+1. **Audio encoder (``Qwen3OmniMoeAudioEncoder``)**:
+   Evaluates 100-frame window counts with integer division on CPU (avoiding TPU
+   float32 reciprocal rounding on exact multiples of 100 frames; see upstream
+   ``vllm-omni#9010``), splits clips longer than 128 windows along 128-window
+   (``16 * n_window_infer``) boundaries, packs consecutive clips into power-of-2
+   window buckets ``(8, 16, 32, 64, 128)``, and compiles one fused TPU graph per
+   bucket via ``torch.compile(..., backend="tpu", fullgraph=True, dynamic=False)``.
+2. **Vision encoder (``Qwen3Omni_VisionTransformer``)**:
+   Greedily packs consecutive small image/video items into groups of at most
+   ``16,384`` patches, splits single videos exceeding ``16,384`` patches along
+   the temporal frame axis via ``embed_multimodal_chunked``, pads each ViT pass
+   and its ``cu_seqlens`` to static ``(4096, 8192, 16384)``-patch buckets,
+   delegates block and DeepStack merger execution to
+   ``forward_with_encoder_metadata``, and cuts the deferred TorchTPU graph
+   between chunks via ``synchronize_tensors(..., wait=False)``.
 
 TODO: retire the 0.32.0rc1 ``xfail`` test in ``test_qwen3_omni_components.py`` once
 vLLM-Omni is bumped to >= 0.33.0rc1 (vllm-omni#9010), and remove this module
-once upstream supports native static audio encoder bucketing on TPU (tracked
-upstream in vllm-project/vllm-omni#7452 and vllm-project/vllm-omni#9566).
+once upstream supports native static audio and vision encoder bucketing on TPU
+(tracked upstream in vllm-project/vllm-omni#7452 and vllm-project/vllm-omni#9566).
 """
 
 from __future__ import annotations
@@ -42,6 +48,7 @@ import torch.nn.functional as F
 from vllm.config import get_current_vllm_config_or_none
 from vllm.utils.math_utils import cdiv
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner.mm_video_chunking import embed_multimodal_chunked
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
@@ -61,6 +68,14 @@ _AUDIO_CHUNK_BUCKETS: tuple[int, ...] = (8, 16, 32, 64, 128)
 _CU_SEQLENS_BLOCK_SIZE = 128
 # Reserve 1 leading ``0`` entry plus up to 1 trailing ``padded_total`` sentinel.
 _CU_SEQLENS_RESERVED_ENTRIES = 2
+# Static patch-count buckets (1024, 2048, and 4096 merged visual tokens at
+# spatial_merge_size=2) covering single images and frame-chunked video sub-grids.
+# Qwen3OmniMoeThinkerForConditionalGeneration._process_image_input and
+# _process_video_input call self.visual(pixel_values, grid_thw) directly inside
+# embed_multimodal rather than routing through MMEncoderManager, and
+# MMEncoderManager only splits across a token budget without padding patches
+# and cu_seqlens to a static XLA shape.
+_VISION_PATCH_BUCKETS: tuple[int, ...] = (4096, 8192, 16384)
 
 
 class _AudioSlice(NamedTuple):
@@ -70,6 +85,33 @@ class _AudioSlice(NamedTuple):
     frame_len: int
     num_chunks: int
     valid_tokens: int
+
+
+def _select_bucket(val: int, buckets: tuple[int, ...], align: int) -> int:
+    for b in buckets:
+        if val <= b:
+            return b
+    return cdiv(val, align) * align
+
+
+def _pad_vit_cu_seqlens(
+    cu_cpu: list[int],
+    padded_total: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Pad ViT ``cu_seqlens`` to a multiple of ``_CU_SEQLENS_BLOCK_SIZE``."""
+    target_len = cdiv(len(cu_cpu) + 1, _CU_SEQLENS_BLOCK_SIZE) * _CU_SEQLENS_BLOCK_SIZE
+    pad_len = target_len - len(cu_cpu)
+    return torch.tensor(
+        cu_cpu + [padded_total] * pad_len, dtype=torch.int32, device="cpu"
+    ).to(device=device)
+
+
+def _pad_rows(x: torch.Tensor, target_rows: int) -> torch.Tensor:
+    pad = target_rows - x.shape[0]
+    if pad <= 0:
+        return x
+    return F.pad(x, (0, 0, 0, pad))
 
 
 def _pad_cu_seqlens(
@@ -477,6 +519,166 @@ def _patch_audio_encoder(
     return True
 
 
+def _padded_vit_forward(
+    self: Any,
+    x: torch.Tensor,
+    grid_thw: torch.Tensor | list[list[int]],
+) -> torch.Tensor:
+    """Pack small items, chunk large videos, and pad each ViT pass to a bucket.
+
+    Upstream: ``Qwen3Omni_VisionTransformer.forward`` in
+    ``vllm_omni/model_executor/models/qwen3_omni/qwen3_omni_moe_thinker.py``
+    (delegating to ``prepare_encoder_metadata`` and
+    ``forward_with_encoder_metadata`` from ``_Qwen3Omni_VisionTransformer``).
+
+    Stayed the same:
+    - ``patch_embed``, ``fast_pos_embed_interpolate``, 2D ``rot_pos_emb``,
+      ``self.blocks`` ViT layers, ``self.merger``, and ``self.merger_list``
+      DeepStack feature concatenation (via ``prepare_encoder_metadata`` and
+      ``forward_with_encoder_metadata``).
+    - Per-frame block-diagonal spatial attention (each temporal frame ``t`` is an
+      independent ``cu_seqlens`` segment), making temporal splitting exact.
+
+    Adapted for TPU:
+    - Greedily packs consecutive items up to ``16,384`` patches and splits single
+      videos exceeding ``16,384`` patches along the temporal frame axis via
+      ``embed_multimodal_chunked``.
+    - Pads each chunk's patches and ``grid_thw`` to a static
+      ``_VISION_PATCH_BUCKETS`` ``(4096, 8192, 16384)`` shape and pads
+      ``cu_seqlens`` to a multiple of 128 via ``_pad_cu_seqlens``
+      (``max_seqlen=None``).
+    - Cuts the deferred TorchTPU graph via ``synchronize_tensors(..., wait=False)``
+      before slicing ``merged_all[:valid_tokens // merge_unit]``.
+    """
+    x_dev = x.to(device=self.device, dtype=self.dtype)
+    if isinstance(grid_thw, torch.Tensor):
+        grid_cpu = grid_thw.to(device="cpu", dtype=torch.int32)
+    else:
+        grid_cpu = torch.tensor(grid_thw, dtype=torch.int32, device="cpu")
+
+    merge_unit = self.spatial_merge_size**2
+    max_bucket = _VISION_PATCH_BUCKETS[-1]
+
+    def _encode_vit_chunk(
+        pixel_values_videos: torch.Tensor,
+        video_grid_thw: torch.Tensor,
+        **_: Any,
+    ) -> list[torch.Tensor]:
+        chunk_grid = (
+            video_grid_thw.to(device="cpu", dtype=torch.int32)
+            if isinstance(video_grid_thw, torch.Tensor)
+            else torch.tensor(video_grid_thw, dtype=torch.int32, device="cpu")
+        )
+        valid_tokens = int(pixel_values_videos.shape[0])
+        # Qwen3-Omni's image/video processor max_pixels keeps single images and
+        # per-frame patch counts <= 16384 (h * w <= 16384); align=512 provides
+        # a bounded fallback if a caller overrides max_pixels.
+        target_tokens = _select_bucket(
+            valid_tokens, _VISION_PATCH_BUCKETS, align=max(512, merge_unit)
+        )
+        pad_tokens = target_tokens - valid_tokens
+        if pad_tokens > 0:
+            pad_frames = pad_tokens // merge_unit
+            pad_row = [[pad_frames, self.spatial_merge_size, self.spatial_merge_size]]
+            padded_grid = torch.cat(
+                [chunk_grid, torch.tensor(pad_row, dtype=torch.int32)],
+                dim=0,
+            )
+            x_padded = _pad_rows(pixel_values_videos, target_tokens)
+        else:
+            padded_grid = chunk_grid
+            x_padded = pixel_values_videos
+
+        valid_frames = int(chunk_grid[:, 0].sum().item())
+        metadata = self.prepare_encoder_metadata(padded_grid)
+        cu_list = metadata["cu_seqlens"].detach().cpu().tolist()
+        metadata["cu_seqlens"] = _pad_vit_cu_seqlens(
+            cu_list[: valid_frames + 1], target_tokens, device=x_dev.device
+        )
+        metadata["max_seqlen"] = None
+
+        merged_all = self.forward_with_encoder_metadata(x_padded, metadata)
+        # Cut the deferred TorchTPU graph before the valid-token slice so the
+        # 27-layer ViT and DeepStack mergers compile once at the static
+        # 16384-patch bucket shape rather than once per valid_tokens length.
+        if merged_all.device.type == "tpu":
+            synchronize_tensors(merged_all, wait=False)
+        return [merged_all[: valid_tokens // merge_unit]]
+
+    # Greedily pack consecutive items into groups of <= max_bucket patches so a
+    # batch of many small images runs in ceil(total / max_bucket) ViT passes
+    # rather than one 16384-padded pass per image; only single items that exceed
+    # max_bucket on their own are split along the frame axis via
+    # embed_multimodal_chunked.
+    grid_rows = grid_cpu.tolist()
+    item_patches = [int(t) * int(h) * int(w) for t, h, w in grid_rows]
+    outputs: list[torch.Tensor] = []
+    group_start = 0
+    group_patches = 0
+    px_start = 0
+
+    for idx, n_patches in enumerate(item_patches):
+        if n_patches > max_bucket:
+            if group_patches > 0:
+                outputs.extend(
+                    _encode_vit_chunk(
+                        pixel_values_videos=x_dev[px_start : px_start + group_patches],
+                        video_grid_thw=grid_cpu[group_start:idx],
+                    )
+                )
+                px_start += group_patches
+                group_patches = 0
+            item_px = x_dev[px_start : px_start + n_patches]
+            outputs.extend(
+                embed_multimodal_chunked(
+                    _encode_vit_chunk,
+                    {
+                        "pixel_values_videos": item_px,
+                        "video_grid_thw": grid_cpu[idx : idx + 1],
+                    },
+                    max_bucket,
+                )
+            )
+            px_start += n_patches
+            group_start = idx + 1
+            continue
+
+        if group_patches + n_patches > max_bucket and group_patches > 0:
+            outputs.extend(
+                _encode_vit_chunk(
+                    pixel_values_videos=x_dev[px_start : px_start + group_patches],
+                    video_grid_thw=grid_cpu[group_start:idx],
+                )
+            )
+            px_start += group_patches
+            group_start = idx
+            group_patches = 0
+
+        group_patches += n_patches
+
+    if group_patches > 0:
+        outputs.extend(
+            _encode_vit_chunk(
+                pixel_values_videos=x_dev[px_start : px_start + group_patches],
+                video_grid_thw=grid_cpu[group_start : len(item_patches)],
+            )
+        )
+
+    if len(outputs) == 1:
+        return outputs[0]
+    return torch.cat(outputs, dim=0)
+
+
+def _patch_vision_encoder(vit_cls: type[Any]) -> bool:
+    """Install frame chunking and static bucketing on Qwen3Omni_VisionTransformer."""
+    orig_forward = vit_cls.forward
+    if orig_forward is _padded_vit_forward:
+        return False
+    vit_cls._tpu_orig_forward = orig_forward
+    vit_cls.forward = _padded_vit_forward
+    return True
+
+
 def maybe_patch_qwen3_omni_thinker(
     architectures: list[str] | None = None,
     *,
@@ -486,15 +688,14 @@ def maybe_patch_qwen3_omni_thinker(
     if not architectures or not _QWEN3_OMNI_ARCHS.intersection(architectures):
         return False
 
-    from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
-        Qwen3OmniMoeAudioEncoder,
+    from vllm_omni.model_executor.models.qwen3_omni import (
+        qwen3_omni_moe_thinker as thinker_mod,
     )
 
     patched = _patch_audio_encoder(
-        Qwen3OmniMoeAudioEncoder, enforce_eager=enforce_eager
+        thinker_mod.Qwen3OmniMoeAudioEncoder, enforce_eager=enforce_eager
     )
+    patched = _patch_vision_encoder(thinker_mod.Qwen3Omni_VisionTransformer) or patched
     if patched:
-        logger.info(
-            "Applied TPU patch: Qwen3-Omni Thinker audio encoder static bucketing."
-        )
+        logger.info("Applied TPU patch: Qwen3-Omni Thinker audio and vision encoders.")
     return patched
