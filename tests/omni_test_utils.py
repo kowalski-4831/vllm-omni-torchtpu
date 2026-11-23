@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from typing import Any
@@ -226,18 +227,46 @@ def use_native_ops_on_cpu(module: nn.Module) -> None:
 @contextmanager
 def isolate_thinker_patch_targets() -> Generator[None]:
     """Snapshot and restore Qwen3-Omni Thinker patch targets across a test."""
+    import vllm.model_executor.models.utils as vllm_utils
     from vllm_omni.model_executor.models.qwen3_omni import (
         qwen3_omni_moe_thinker as thinker_mod,
     )
 
-    with (
-        restore_class_attrs(
-            thinker_mod.Qwen3OmniMoeAudioEncoder,
-            ("forward", "_tpu_orig_forward", "_tpu_enforce_eager"),
-        ),
-        restore_class_attrs(
-            thinker_mod.Qwen3Omni_VisionTransformer,
-            ("forward", "_tpu_orig_forward"),
-        ),
-    ):
-        yield
+    thinker_cls = thinker_mod.Qwen3OmniMoeThinkerForConditionalGeneration
+    saved_mod = {
+        attr: getattr(thinker_mod, attr, None)
+        for attr in (
+            "_merge_multimodal_embeddings",
+            "check_interleaved_audio_video",
+            "merge_interleaved_embeddings",
+        )
+    }
+    saved_vllm_merge = vllm_utils._merge_multimodal_embeddings
+    models_prefix = "vllm.model_executor.models."
+    saved_model_merges = {
+        mod: mod.__dict__["_merge_multimodal_embeddings"]
+        for name, mod in list(sys.modules.items())
+        if name.startswith(models_prefix)
+        and mod is not None
+        and "_merge_multimodal_embeddings" in mod.__dict__
+    }
+    try:
+        with (
+            restore_class_attrs(
+                thinker_mod.Qwen3OmniMoeAudioEncoder,
+                ("forward", "_tpu_orig_forward", "_tpu_enforce_eager"),
+            ),
+            restore_class_attrs(
+                thinker_mod.Qwen3Omni_VisionTransformer,
+                ("forward", "_tpu_orig_forward"),
+            ),
+            restore_class_attrs(thinker_cls, ("embed_input_ids",)),
+        ):
+            yield
+    finally:
+        for attr, val in saved_mod.items():
+            if val is not None:
+                setattr(thinker_mod, attr, val)
+        vllm_utils._merge_multimodal_embeddings = saved_vllm_merge
+        for mod, fn in saved_model_merges.items():
+            mod.__dict__["_merge_multimodal_embeddings"] = fn
