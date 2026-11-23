@@ -173,21 +173,18 @@ def test_tpu_ar_model_runner_init_connectors_and_rejects_speculative() -> None:
 
 
 @pytest.mark.parametrize(
-    ("has_preprocess", "has_postprocess", "error_match"),
+    ("has_preprocess", "has_postprocess"),
     [
-        (False, False, None),
-        (True, False, "has_preprocess"),
-        (False, True, "has_postprocess"),
-        (True, True, "has_preprocess, has_postprocess"),
+        (False, False),
+        (True, True),
     ],
-    ids=["thinker", "preprocess_only", "postprocess_only", "talker_both"],
+    ids=["thinker", "talker"],
 )
-def test_load_model_checks_per_step_hook_capabilities(
+def test_load_model_accepts_thinker_and_talker_hook_capabilities(
     monkeypatch: pytest.MonkeyPatch,
     tpu_ar_model_runner: TPUARModelRunner,
     has_preprocess: bool,
     has_postprocess: bool,
-    error_match: str | None,
 ) -> None:
     model = _StageModel(
         torch.zeros(1, 4),
@@ -199,12 +196,8 @@ def test_load_model_checks_per_step_hook_capabilities(
         "load_model",
         lambda self: setattr(self, "model", model),
     )
-    if error_match is None:
-        tpu_ar_model_runner.load_model()
-        assert tpu_ar_model_runner.get_model() is model
-    else:
-        with pytest.raises(NotImplementedError, match=error_match):
-            tpu_ar_model_runner.load_model()
+    tpu_ar_model_runner.load_model()
+    assert tpu_ar_model_runner.get_model() is model
 
 
 @pytest.mark.parametrize("enforce_eager", [False, True])
@@ -605,7 +598,7 @@ def test_tpu_ar_model_runner_capture_model_precompiles_mm_buckets(
         assert seen_modalities == ["empty"]
         assert seen_merges == []
 
-        # Non-MM, enforce_eager, or non-first PP stage skips MM precompilation
+        # Non-MM, enforce_eager, non-first PP stage, or talker stage skips MM warmup
         runner.mm_budget.mm_max_toks_per_item = {"audio": 390}
         for attr in ("supports_mm_inputs", "_pp_is_first"):
             seen_modalities.clear()
@@ -615,6 +608,14 @@ def test_tpu_ar_model_runner_capture_model_precompiles_mm_buckets(
             assert seen_modalities == []
             assert seen_merges == []
             setattr(runner, attr, True)
+
+        seen_modalities.clear()
+        seen_merges.clear()
+        runner.model_stage = "talker"
+        runner.capture_model()
+        assert seen_modalities == []
+        assert seen_merges == []
+        runner.model_stage = "thinker"
 
         seen_modalities.clear()
         seen_merges.clear()
@@ -850,3 +851,117 @@ def test_update_states_manages_intermediate_buffer_and_connector_cleanup(
         is runner.model_intermediate_buffer["req-new"]
     )
     assert runner.model_intermediate_buffer["req-cached"]["meta"] == {"resumable": True}
+
+
+def test_tpu_ar_model_runner_talker_hooks_and_inter_stage_outputs() -> None:
+    runner = TPUARModelRunner(
+        SimpleNamespace(
+            model_config=_stage_config(model_stage="talker", stage_id=1),
+            speculative_config=None,
+        ),
+        torch.device("tpu"),
+        profiler_rank=0,
+        profiler_world_size=1,
+    )
+    runner.supports_mm_inputs = False
+    runner.input_batch = SimpleNamespace(
+        num_reqs=1,
+        req_ids=["req-0"],
+        num_computed_tokens_cpu=[4],
+    )
+    runner.query_start_loc_np = [0, 1]
+    runner.requests = {"req-0": SimpleNamespace(prompt_token_ids=[10, 11, 12, 13])}
+    runner._omni_chunk_req_slice = (0, 1)
+
+    class DummyTalkerStage:
+        has_preprocess = True
+        has_postprocess = True
+        gpu_resident_buffer_keys = {("hidden_states", "last"), ("codes", "audio")}
+
+        def __call__(self, **kwargs: Any) -> torch.Tensor:
+            return torch.full((16, 8), 9.0)
+
+        def preprocess(
+            self, input_ids: Any, input_embeds: Any = None, **req_info: Any
+        ) -> tuple[Any, torch.Tensor, dict[str, Any]]:
+            assert req_info["_omni_num_computed_tokens"] == 4
+            assert req_info["_omni_is_prefill"] is False
+            return (
+                input_ids,
+                torch.ones(1, 8),
+                {"mtp_inputs": (torch.full((1, 8), 2.0), torch.full((1, 8), 3.0))},
+            )
+
+        def talker_mtp(
+            self,
+            input_ids: Any,
+            input_embeds: torch.Tensor,
+            last_hidden: torch.Tensor,
+            text_step: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return input_embeds + last_hidden + text_step, torch.arange(16).unsqueeze(0)
+
+        def postprocess(
+            self, hidden_states: torch.Tensor, **kwargs: Any
+        ) -> dict[str, Any]:
+            return {"hidden_states": {"last": hidden_states[-1].detach()}}
+
+        def make_omni_output(
+            self, model_outputs: torch.Tensor, model_intermediate_buffer: Any = None
+        ) -> OmniOutput:
+            codes = [b["codes"]["audio"] for b in model_intermediate_buffer]
+            audio_codes = torch.cat(codes, dim=0)
+            return OmniOutput(
+                text_hidden_states=model_outputs[: audio_codes.shape[0]],
+                multimodal_outputs={"codes": {"audio": audio_codes}},
+            )
+
+    runner.model = DummyTalkerStage()
+    out_ids, out_embeds = runner._get_model_inputs(
+        torch.tensor([42], dtype=torch.long), None
+    )
+    assert out_ids is None
+    assert out_embeds is not None
+    assert torch.equal(out_embeds, torch.full((1, 8), 6.0))
+    assert torch.equal(
+        runner.model_intermediate_buffer["req-0"]["codes"]["audio"],
+        torch.arange(16).unsqueeze(0),
+    )
+
+    # forward_model preserves the full padded bucket tensor (16, 8) for TPUModelRunner
+    # while recording multimodal_outputs and consuming _omni_chunk_req_slice.
+    fwd_out, fwd_aux = runner.forward_model(None, torch.arange(16), out_embeds)
+    assert isinstance(fwd_out, torch.Tensor)
+    assert fwd_out.shape == (16, 8)
+    assert fwd_aux is None
+    assert runner._omni_chunk_req_slice is None
+    assert torch.equal(
+        runner.model_intermediate_buffer["req-0"]["hidden_states"]["last"],
+        torch.full((8,), 9.0),
+    )
+
+    # A subsequent warmup/_dummy_run call with _omni_chunk_req_slice=None skips
+    # preprocess/postprocess and does not overwrite _omni_chunk_outputs.
+    dummy_ids, dummy_embeds = runner._get_model_inputs(
+        torch.tensor([99], dtype=torch.long), None
+    )
+    assert dummy_ids is not None
+    assert torch.equal(dummy_ids, torch.tensor([99], dtype=torch.long))
+    assert dummy_embeds is None
+    runner.forward_model(dummy_ids, torch.arange(1), None)
+    assert len(runner._omni_chunk_outputs) == 1
+
+    inner_out = SimpleNamespace(req_ids=["req-0"], inter_stage_outputs=None)
+    runner._omni_connector_initialized = True
+    runner._should_accumulate_full_payload_output = MagicMock(return_value=False)
+    runner.attach_omni_connector_output = MagicMock(side_effect=lambda x: x)
+    with patch.object(
+        OmniTPUModelRunner, "sample_tokens", return_value=_async_output(inner_out)
+    ):
+        runner.sample_tokens()
+    assert len(inner_out.inter_stage_outputs) == 1
+    assert torch.equal(
+        inner_out.inter_stage_outputs[0]["codes"]["audio"],
+        torch.arange(16).unsqueeze(0),
+    )
+    runner.attach_omni_connector_output.assert_called_once_with(inner_out)

@@ -54,12 +54,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Model capability flags that ``GPUARModelRunner`` reads (through
-# ``_model_omni_flag``) to drive the per-step preprocess / postprocess hooks.
-# vLLM-Omni models set them in ``__init__``: the Qwen3-Omni thinker sets both
-# to False, the talker sets both to True.
-_UNSUPPORTED_HOOK_FLAGS = ("has_preprocess", "has_postprocess")
-
 
 def _slice_mm_embeds_by_row_indices(
     mm_embeds: Sequence[torch.Tensor],
@@ -256,18 +250,10 @@ def _merge_chunk_payload(
 class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
     """TPU runner for autoregressive stages; counterpart of ``GPUARModelRunner``.
 
-    Wires inter-stage Omni connectors (with ``OmniKVTransferManager``),
-    per-request ``model_intermediate_buffer`` lifecycle updates, multi-chunk
-    ``inter_stage_outputs`` extraction, and multimodal mixed-dimension slicing.
-
-    Features not yet wired are refused with ``NotImplementedError``:
-
-    - at construction, speculative decoding (``speculative_config``): draft-model
-      auxiliary hidden states are not verified or wired on ``TPUARModelRunner``;
-    - at ``load_model``, a model that declares the per-step
-      ``preprocess`` / ``postprocess`` hooks (``has_preprocess`` /
-      ``has_postprocess``): the talker path, which runs multi-token
-      prediction around every step.
+    Serves the Thinker and Talker stages on TPU, wiring inter-stage Omni
+    connectors (with ``OmniKVTransferManager``), multimodal mixed-dimension
+    chunk slicing, and the Talker's ``preprocess``, ``talker_mtp``,
+    ``postprocess``, and ``make_omni_output`` hooks.
     """
 
     _omni_connector_initialized: bool = False
@@ -295,26 +281,12 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
             )
 
     def load_model(self) -> None:
-        """Load the stage model, then refuse one whose hooks nobody would call."""
+        """Apply Qwen3-Omni stage patches and load the stage model."""
         maybe_patch_qwen3_omni_thinker(
             self.model_config.architectures,
             enforce_eager=self.enforce_eager,
         )
         super().load_model()
-        model = self.get_model()
-        has_unsupported_flags = [
-            flag
-            for flag in _UNSUPPORTED_HOOK_FLAGS
-            if bool(getattr(model, flag, False))
-        ]
-        if len(has_unsupported_flags) > 0:
-            raise NotImplementedError(
-                f"Stage {self.stage_id} ({self.model_stage!r}): "
-                f"{type(model).__name__} declares {', '.join(has_unsupported_flags)}, "
-                "so it relies on the per-step preprocess/postprocess hooks (the "
-                "talker's multi-token prediction), which TPUARModelRunner does not "
-                "run yet."
-            )
 
     def _update_states(self, scheduler_output: SchedulerOutput) -> bool:
         """Update Omni buffers and connector state alongside TPU batch state.
@@ -427,7 +399,12 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
 
     def capture_model(self) -> None:
         super().capture_model()
-        if self.enforce_eager or not self.supports_mm_inputs or not self._pp_is_first:
+        if (
+            self.enforce_eager
+            or not self.supports_mm_inputs
+            or not self._pp_is_first
+            or self.model_stage not in (None, "thinker")
+        ):
             return
         self._precompile_mm_inputs()
 
@@ -515,7 +492,21 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
         input_ids: torch.Tensor,
         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Resolve 1D row-index ranges and guard DeepStack buffers across steps."""
+        """Resolve MM slices, DeepStack guards, and ``preprocess`` / ``talker_mtp``.
+
+        Upstream: ``GPUARModelRunner`` per-request ``preprocess`` and
+        ``talker_mtp`` execution in ``vllm_omni/worker/gpu_ar_model_runner.py``.
+        Stayed the same: syncs received full-payload stage inputs, calls
+        ``model.preprocess(input_ids=..., input_embeds=..., **req_info)`` per
+        request, updates ``model_intermediate_buffer``, and on decode steps runs
+        ``model.talker_mtp(...)`` to fold residual acoustic embeddings into
+        ``inputs_embeds`` and record ``codes["audio"]``.
+        Adapted for TPU: resolves 1D multimodal row-index slices first via
+        ``_slice_mm_embeds_by_row_indices``, clears/flushes DeepStack buffers
+        across steps, slices/writes ``inputs_embeds[s:e]`` across TPU execution
+        chunks (``_chunk_req_spans``) without CUDAGraph staging buffers, and
+        detaches ``code_predictor_codes`` to CPU.
+        """
         if mm_embed_inputs is not None and self._omni_mm_embeds_list is not None:
             chunk_embeds, is_mm_embed = mm_embed_inputs
             if len(chunk_embeds) == 1 and chunk_embeds[0].ndim == 1:
@@ -536,7 +527,9 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
             self.model._clear_deepstack_input_embeds(
                 self.model.deepstack_input_embeds_num_tokens
             )
-        out_ids, inputs_embeds = super()._get_model_inputs(input_ids, mm_embed_inputs)
+        model_input_ids, inputs_embeds = super()._get_model_inputs(
+            input_ids, mm_embed_inputs
+        )
         if (
             use_deepstack
             and (cleared_deepstack or self.model.deepstack_input_embeds_num_tokens > 0)
@@ -544,7 +537,95 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
             and inputs_embeds.device.type == "tpu"
         ):
             synchronize_tensors(self.model.deepstack_input_embeds, wait=False)
-        return out_ids, inputs_embeds
+        orig_model = _unwrap_model(self.model)
+        chunk_spans = self._chunk_req_spans()
+        if getattr(orig_model, "has_preprocess", False) and chunk_spans:
+            if self._omni_connector_initialized and not getattr(
+                self.model_config, "async_chunk", False
+            ):
+                self._sync_local_stage_payloads()
+            preprocess_ids = (
+                model_input_ids if model_input_ids is not None else input_ids
+            )
+            if inputs_embeds is None and preprocess_ids is not None:
+                embed_fn = getattr(
+                    orig_model,
+                    "embed_input_ids",
+                    getattr(self.model, "embed_input_ids", None),
+                )
+                if callable(embed_fn):
+                    inputs_embeds = embed_fn(preprocess_ids)
+            if inputs_embeds is not None:
+                inputs_embeds = inputs_embeds.clone()
+            num_computed_arr = self.input_batch.num_computed_tokens_cpu
+            mtp_fn = getattr(orig_model, "talker_mtp", None)
+            for req_id, req_idx, s, e in chunk_spans:
+                if s >= e:
+                    continue
+                req_info = self.model_intermediate_buffer.setdefault(req_id, {})
+                num_computed = (
+                    int(num_computed_arr[req_idx])
+                    if req_idx < len(num_computed_arr)
+                    else 0
+                )
+                req_state = self.requests.get(req_id)
+                prompt_token_ids = (
+                    getattr(req_state, "prompt_token_ids", None)
+                    if req_state is not None
+                    else None
+                )
+                prompt_len = len(prompt_token_ids) if prompt_token_ids else 0
+                is_prefill = (
+                    (num_computed < prompt_len)
+                    if prompt_len > 0
+                    else (num_computed == 0)
+                )
+                req_info["_omni_prompt_len"] = prompt_len
+                req_info["_omni_num_computed_tokens"] = num_computed
+                req_info["_omni_is_prefill"] = is_prefill
+                r_ids = preprocess_ids[s:e] if preprocess_ids is not None else None
+                r_embeds = inputs_embeds[s:e] if inputs_embeds is not None else None
+                p_ids, p_embeds, update_dict = orig_model.preprocess(
+                    input_ids=r_ids, input_embeds=r_embeds, **req_info
+                )
+                self._update_intermediate_buffer(req_id, update_dict)
+                if isinstance(p_embeds, torch.Tensor):
+                    if inputs_embeds is None:
+                        total_tokens = (
+                            preprocess_ids.shape[0] if preprocess_ids is not None else e
+                        )
+                        inputs_embeds = torch.zeros(
+                            (total_tokens, p_embeds.shape[-1]),
+                            dtype=p_embeds.dtype,
+                            device=p_embeds.device,
+                        )
+                    p_len = min(e - s, p_embeds.shape[0])
+                    inputs_embeds[s : s + p_len] = p_embeds[:p_len].to(
+                        device=inputs_embeds.device, dtype=inputs_embeds.dtype
+                    )
+                mtp_inputs = req_info.pop("mtp_inputs", None)
+                if (
+                    not is_prefill
+                    and callable(mtp_fn)
+                    and mtp_inputs is not None
+                    and inputs_embeds is not None
+                ):
+                    last_talker_hidden, text_step = mtp_inputs
+                    mtp_embeds, code_predictor_codes = mtp_fn(
+                        p_ids,
+                        inputs_embeds[s:e],
+                        last_talker_hidden.to(device=inputs_embeds.device),
+                        text_step.to(device=inputs_embeds.device),
+                    )
+                    inputs_embeds[s:e] = mtp_embeds.reshape(-1, inputs_embeds.shape[-1])
+                    if isinstance(code_predictor_codes, torch.Tensor):
+                        code_predictor_codes = code_predictor_codes.detach().cpu()
+                    self._update_intermediate_buffer(
+                        req_id, {"codes": {"audio": code_predictor_codes}}
+                    )
+            if inputs_embeds is not None:
+                return None, inputs_embeds
+        return model_input_ids, inputs_embeds
 
     def forward_model(
         self,
@@ -553,7 +634,7 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
         inputs_embeds: torch.Tensor | None = None,
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> tuple[torch.Tensor | IntermediateTensors, torch.Tensor | None]:
-        """Run the stage model and record per-chunk inter-stage sidecar outputs.
+        """Run the stage model, execute postprocess hooks, and record chunk outputs.
 
         Normalises Omni stage outputs through ``model.make_omni_output`` into an
         ``OmniOutput`` and records per-chunk ``multimodal_outputs`` in
@@ -584,21 +665,48 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
         if isinstance(out, (list, tuple)) and len(out) == 1:
             out = out[0]
         orig_model = _unwrap_model(self.model)
+        has_postprocess = bool(getattr(orig_model, "has_postprocess", False))
+        if has_postprocess and chunk_spans and isinstance(out, torch.Tensor):
+            for req_id, _req_idx, s, e in chunk_spans:
+                req_info = self.model_intermediate_buffer.get(req_id, {})
+                post_kwargs = {
+                    k: v for k, v in req_info.items() if k != "hidden_states"
+                }
+                update_dict = orig_model.postprocess(out[s:e], **post_kwargs)
+                self._update_intermediate_buffer(req_id, update_dict)
+
         make_fn = getattr(orig_model, "make_omni_output", None)
         aux_hidden: torch.Tensor | None = None
         if isinstance(out, OmniOutput):
             omni_out: OmniOutput | None = out
             text_hidden = out.text_hidden_states
-        elif callable(make_fn):
-            res = make_fn(out)
+        elif callable(make_fn) and (chunk_spans or not has_postprocess):
+            make_kwargs: dict[str, Any] = {}
+            if chunk_spans and has_postprocess:
+                make_kwargs["model_intermediate_buffer"] = [
+                    self.model_intermediate_buffer.get(rid, {})
+                    for rid, _, _, _ in chunk_spans
+                ]
+            res = make_fn(out, **make_kwargs)
             omni_out = res if isinstance(res, OmniOutput) else None
-            text_hidden = omni_out.text_hidden_states if omni_out is not None else res
-        else:
+            # Talker's make_omni_output slices talker_hidden[:span_len] to match
+            # unpadded audio codes, whereas TPUModelRunner.execute_model indexes
+            # the full padded bucket tensor at logits_indices.
+            if has_postprocess and isinstance(out, torch.Tensor):
+                text_hidden = out
+            else:
+                text_hidden = (
+                    omni_out.text_hidden_states if omni_out is not None else res
+                )
+        elif not callable(make_fn):
             omni_out = None
             if isinstance(out, (list, tuple)) and len(out) == 2:
                 text_hidden, aux_hidden = out[0], out[1]
             else:
                 text_hidden = out
+        else:
+            omni_out = None
+            text_hidden = out[0] if isinstance(out, tuple) else out
 
         if (
             chunk_spans
